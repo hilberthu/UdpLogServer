@@ -1,0 +1,2 @@
+webpackJsonp([0],{Q5rI:function(a,n,t){"use strict";var r=t("mtWM"),c=t.n(r);n.a={myajax:function(a,n,t,r){var e="/ajax?action="+a+"&data="+n;return c.a.get(e).then(function(a){return t(r,a)})}}}});
+//# sourceMappingURL=0.c9b78e6752ba93544b18.js.map

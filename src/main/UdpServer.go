@@ -1,47 +1,40 @@
 package main
 
 import (
-	"os"
 	"encoding/json"
-	"net/http"
-	"io/ioutil"
-	"utils"
-	"strings"
-	"net"
-	"log"
-	"io"
-	"fmt"
-	"time"
-	"reflect"
 	"errors"
-	"sort"
-	"html/template"
-	"bufio"
-	"sync"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strconv"
-	"math"
+	"strings"
+	"time"
+	"utils"
+
+	"github.com/bvinc/go-sqlite-lite/sqlite3"
 )
 
+var G_DBConn *sqlite3.Conn
+
 type ServerConf struct {
-	MysqlConf string
-	HttpPort  string
-	UdpPort   string
+	HttpPort string
+	UdpPort  string
 }
 
-type FileItem struct {
-	FileName       string
-	FileDir        string
-	FileModifyTime int64
-	FileCreateTime string
-}
-
-type FileContent struct {
+type LogContent struct {
+	UID     int64
 	Level   string
+	Tag     string
 	Content string
 }
 
 var G_StConf ServerConf
-var FileCreateTimeMap sync.Map
 
 func loadConf() {
 	fi, err := os.Open("conf.json")
@@ -54,8 +47,9 @@ func loadConf() {
 	err = json.Unmarshal(fd, &G_StConf)
 	if err != nil {
 		utils.Debugln("error:", err)
-		os.Exit(0)
+		//os.Exit(0)
 	}
+	fmt.Println(G_StConf)
 	return
 }
 
@@ -73,16 +67,46 @@ func FunctionMapCall(m map[string]interface{}, name string, params ...interface{
 	return
 }
 
+func querylog(w http.ResponseWriter, r *http.Request, strData string) {
+	retMap := GetRetMap()
+	vStr := strings.Split(strData, "|")
+	UID, _ := strconv.ParseInt(vStr[0], 10, 64)
+	StartTime, _ := strconv.ParseInt(vStr[1], 10, 64)
+	EndTime, _ := strconv.ParseInt(vStr[2], 10, 64)
+	fmt.Println("param==", UID, StartTime, EndTime)
+
+	stmt, err := G_DBConn.Prepare(`SELECT * FROM loginfo WHERE uid = ? and time >=? and  time<=?`, UID, StartTime, EndTime)
+	var uid int64
+	var level int
+	var rcvTime int64
+	var tag string
+	var content string
+	for {
+		hasRow, err := stmt.Step()
+		if !hasRow {
+			break
+		}
+		err = stmt.Scan(&uid, &level, &rcvTime, &tag, &content)
+		if err != nil {
+			break
+		}
+		fmt.Println("uid", uid)
+	}
+	err = stmt.Scan(&uid, &level, &rcvTime, &tag, &content)
+	if err != nil {
+		checkErr(err)
+	}
+	fmt.Println("uid", uid)
+
+	var nUids []int64
+	json.Unmarshal([]byte(strData), &nUids)
+	fmt.Fprint(w, RetMap2String(retMap))
+}
+
 func ajaxHandler(w http.ResponseWriter, r *http.Request) {
 	utils.Debugln("ajaxHandler begin---------------")
 	funcs := make(map[string]interface{})
-	funcs["getTemplates"] = getTemplates
-	funcs["getdirs"] = getdirs
-	funcs["getFiles"] = getFiles
-	funcs["getFileContentWithLevel"] = getFileContentWithLevel
-	funcs["getFileContent"] = getFileContent
-	funcs["getRoomFiles"] = getRoomFiles
-
+	funcs["querylog"] = querylog
 	strAction := r.FormValue("action")
 	strData := r.FormValue("data")
 	utils.Debugln("ajaxHandler---------------", strAction, strData)
@@ -101,293 +125,151 @@ func RetMap2String(retMap map[string]string) string {
 	return string(v)
 }
 
-func getFileContent(w http.ResponseWriter, r *http.Request, strData string) {
-	fmt.Println("getFileContent begin")
-	retMap := GetRetMap()
-	pstFile, err := os.OpenFile("log/"+strData, os.O_RDONLY, 0666)
+func handleUpload(w http.ResponseWriter, request *http.Request) {
+	BaseUploadPath := "./LogFiles"
+	//文件上传只允许POST方法
+	if request.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte("Method not allowed"))
+		return
+	}
+
+	//从表单中读取文件
+	file, fileHeader, err := request.FormFile("file")
 	if err != nil {
-		pstFile, err = os.OpenFile("room/"+strData, os.O_RDONLY, 0666)
+		_, _ = io.WriteString(w, "Read file error")
+		log.Println("err==: " + err.Error())
+		return
 	}
-	var FileContentList []FileContent
-	if (err == nil) {
-		buf := bufio.NewReader(pstFile)
-		for {
-			line, err := buf.ReadString('\n')
-			vStrings := strings.Split(line, "|")
-			if (len(vStrings) < 3) {
-				break
-			}
-			var stFileContent FileContent
-			stFileContent.Level = vStrings[1]
-			stFileContent.Content = line
-			FileContentList = append(FileContentList, stFileContent)
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-			}
-		}
-		pstFile.Close()
+	//defer 结束时关闭文件
+	defer file.Close()
+	log.Println("filename: " + fileHeader.Filename)
+	vData := strings.Split(fileHeader.Filename, "_")
+	if len(vData) < 7 {
+		_, _ = io.WriteString(w, "file format error")
+		return
 	}
-	Buffer, err := json.Marshal(FileContentList)
-	if (err == nil) {
-		retMap["data"] = string(Buffer)
-	}
-	fmt.Fprint(w, RetMap2String(retMap))
-}
-
-func getFileContentWithLevel(w http.ResponseWriter, r *http.Request, strData string) {
-	fmt.Println("getFileContent begin")
-	var ParamMap  map[string]string
-	json.Unmarshal([]byte(strData),&ParamMap)
-
-    PangeNo,_ := strconv.Atoi(ParamMap["PageNum"])
-	PageSize,_ := strconv.Atoi(ParamMap["PageSize"])
-    nFromIndex := (PangeNo-1) * PageSize
-    nEndIndex := PangeNo * PageSize
-    fmt.Println("nFromIndex==",nFromIndex,"nEndIndex==",nEndIndex)
-	vParam := strings.Split(ParamMap["Levels"], "|")
-	var levelMap  = make(map[string]bool)
-	if len(vParam) == 0 {
-		levelMap["0"] = true
-		levelMap["1"] = true
-		levelMap["2"] = true
-		levelMap["3"] = true
-		levelMap["4"] = true
-		levelMap["5"] = true
-	} else {
-		for i := 0; i < len(vParam); i++ {
-			levelMap[vParam[i]] = true
-		}
-	}
-	fmt.Println("levels=", levelMap)
-	retMap := GetRetMap()
-	PthSep := string(os.PathSeparator)
-	pstFile, err := os.OpenFile("log"+PthSep+ParamMap["FileName"], os.O_RDONLY, 0666)
+	destPath := BaseUploadPath + "/" + vData[0]
+	os.Mkdir(destPath, os.ModeDir)
+	//创建文件
+	newFile, err := os.Create(destPath + "/" + fileHeader.Filename)
 	if err != nil {
-		pstFile, err = os.OpenFile("room"+PthSep+ParamMap["FileName"], os.O_RDONLY, 0666)
+		_, _ = io.WriteString(w, "Create file error:"+destPath+"/"+fileHeader.Filename)
+		return
 	}
-	TotalPageNum := 0
-	var FileContentList []FileContent
-	if err == nil {
-		buf := bufio.NewReader(pstFile)
-		nLineIndex:=0
-		for {
+	//defer 结束时关闭文件
+	defer newFile.Close()
 
-			line, err := buf.ReadString('\n')
-			//fmt.Println("line=", line)
-			vStrings := strings.Split(line, "|")
-			if len(vStrings) < 3{
-				break
+	//将文件写到本地
+	_, err = io.Copy(newFile, file)
+	if err != nil {
+		_, _ = io.WriteString(w, "Write file error")
+		return
+	}
+	_, _ = io.WriteString(w, "Upload success")
+}
+
+func handleDownload(w http.ResponseWriter, request *http.Request) {
+	BaseUploadPath := "./Logfiles"
+	//文件上传只允许GET方法
+	if request.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte("Method not allowed"))
+		return
+	}
+	//文件名
+	filename := request.FormValue("filename")
+	if filename == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "Bad request")
+		return
+	}
+	log.Println("filename: " + filename)
+	//打开文件
+	file, err := os.Open(BaseUploadPath + "/" + filename)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "Bad request")
+		return
+	}
+	//结束后关闭文件
+	defer file.Close()
+
+	//设置响应的header头
+	w.Header().Add("Content-type", "application/octet-stream")
+	w.Header().Add("content-disposition", "attachment; filename=\""+filename+"\"")
+	//将文件写至responseBody
+	_, err = io.Copy(w, file)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "Bad request")
+		return
+	}
+}
+
+func getFilelist(path string) {
+	for {
+		var diff_time int64 = 24 * 3600 * 3
+		now_time := time.Now().Unix() //当前时间，使用Unix时间戳
+		err := filepath.Walk(path, func(path string, f os.FileInfo, err error) error {
+			if f == nil {
+				return err
 			}
-
-			var stFileContent FileContent
-			stFileContent.Level = vStrings[1]
-			stFileContent.Content = line
-			if levelMap[stFileContent.Level] {
-				if nLineIndex >=nFromIndex && nLineIndex <= nEndIndex{
-					FileContentList = append(FileContentList, stFileContent)
+			file_time := f.ModTime().Unix()
+			if (now_time - file_time) > diff_time { //判断文件是否超过3天
+				fmt.Printf("Delete file %v !\r\n", path)
+				println(path)
+				if path != "./LogFiles/" {
+					os.RemoveAll(path)
 				}
-				nLineIndex++
 
+			} else {
+				println(path)
 			}
-
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-			}
-		}
-		fmt.Println("nLineIndex==",nLineIndex)
-		TotalPageNum = int(math.Ceil(float64(nLineIndex) / float64(PageSize)))
-		pstFile.Close()
-	}
-	Buffer, err := json.Marshal(FileContentList)
-	PageInfoAndFileContent := make(map[string]string)
-	PageInfoAndFileContent["FileContent"] = string(Buffer)
-	PageInfoAndFileContent["TotalPageNum"] = strconv.Itoa(TotalPageNum)
-	if err == nil {
-		strData,_ := json.Marshal(PageInfoAndFileContent)
-		retMap["data"] = string(strData)
-	}
-	fmt.Fprint(w, RetMap2String(retMap))
-}
-
-func getdirs(w http.ResponseWriter, r *http.Request, strData string) {
-	retMap := GetRetMap()
-	Files, err := ListDir("log", "")
-	if (err == nil) {
-		buff, _ := json.Marshal(Files)
-		retMap["data"] = string(buff)
-	}
-	fmt.Fprint(w, RetMap2String(retMap))
-}
-
-func getFiles(w http.ResponseWriter, r *http.Request, strData string) {
-	retMap := GetRetMap()
-	Files, err := ListFile("log/"+strData, "")
-	if (err == nil) {
-		buff, _ := json.Marshal(Files)
-		retMap["data"] = string(buff)
-	}
-	fmt.Fprint(w, RetMap2String(retMap))
-}
-
-func getRoomFiles(w http.ResponseWriter, r *http.Request, strData string) {
-	retMap := GetRetMap()
-	Files, err := ListFile("room", "")
-	if (err == nil) {
-		buff, _ := json.Marshal(Files)
-		retMap["data"] = string(buff)
-	}
-	fmt.Fprint(w, RetMap2String(retMap))
-}
-
-func getTemplates(w http.ResponseWriter, r *http.Request, strData string) {
-	var FileList []string
-	json.Unmarshal([]byte(strData), &FileList)
-	var templatesMap map[string]string = make(map[string]string)
-	retMap := GetRetMap()
-	for i := 0; i < len(FileList); i++ {
-		strFullName := "template/" + FileList[i]
-		fi, err := os.Open(strFullName)
+			return nil
+		})
 		if err != nil {
-			panic(err)
+			fmt.Printf("filepath.Walk() returned %v\r\n", err)
 		}
-		defer fi.Close()
-		fd, err := ioutil.ReadAll(fi)
-		templatesMap[FileList[i]] = string(fd)
-		utils.Debugln("getTemplates:", string(fd))
-
+		time.Sleep(time.Second * 60)
 	}
-	templatesFiles2String := RetMap2String(templatesMap)
-	retMap["data"] = templatesFiles2String
-	fmt.Fprint(w, RetMap2String(retMap))
-}
 
+}
 func StartWeb() error {
 	//http.Handle("/", http.FileServer(http.Dir("./log")))
-	http.Handle("/1/", http.StripPrefix("/1/", http.FileServer(http.Dir("./"))))
-	http.Handle("/", http.FileServer(http.Dir("resources/")))
-	http.HandleFunc("/index", leftbarHandler)
+	//http://192.168.122.88:10021/?filename=conf.json
 	http.HandleFunc("/ajax", ajaxHandler)
+	http.HandleFunc("/upload", handleUpload)
+	http.HandleFunc("/download", handleDownload)
+	fsh := http.FileServer(http.Dir("./dist"))
+	http.Handle("/dist/", http.StripPrefix("/dist/", fsh))
+	fsh2 := http.FileServer(http.Dir("./LogFiles"))
+	http.Handle("/LogFiles/", http.StripPrefix("/LogFiles/", fsh2))
 	err := http.ListenAndServe(G_StConf.HttpPort, nil)
+	if err != nil {
+		fmt.Println("http listen " + G_StConf.HttpPort)
+	} else {
+		fmt.Println("http listen failed " + G_StConf.HttpPort)
+	}
 	return err
 
 }
 
-func GetFileModTime(path string) int64 {
-	f, err := os.Open(path)
-	if err != nil {
-		log.Println("open file error")
-		return time.Now().Unix()
-	}
-	defer f.Close()
-
-	fi, err := f.Stat()
-	if err != nil {
-		log.Println("stat fileinfo error")
-		return time.Now().Unix()
-	}
-	return fi.ModTime().Unix()
-}
-
-func GetFileCreateTime(path string) string {
-	strRet, OK := FileCreateTimeMap.Load(path)
-	if (OK) {
-		return strRet.(string)
-	}
-
-	CreateTime:=time.Unix(GetFileModTime(path),0)
-	return CreateTime.Format("2006/01/02 15:04:05")
-}
-
-func leftbarHandler(w http.ResponseWriter, r *http.Request) {
-
-	//ServerGroups := GetServerGroups()
-	t, err := template.ParseFiles("template/leftbar.html")
-	if err != nil {
-		utils.Debugln("ParseFiles error", err.Error())
-	}
-
-	err = t.Execute(w, nil)
-	if err != nil {
-		utils.Debugln("ParseFiles error", err.Error())
-	}
-
-}
-
-type FileItems []FileItem
-
-func (a FileItems) Len() int           { return len(a) }
-func (a FileItems) Less(i, j int) bool { return (a[i].FileModifyTime < a[j].FileModifyTime) }
-func (a FileItems) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-
-func ListDir(dirPth string, suffix string) (files FileItems, err error) {
-	//files = make([]string, 0, 10)
-	dir, err := ioutil.ReadDir(dirPth)
-	if err != nil {
-		return nil, err
-	}
-	PthSep := string(os.PathSeparator)
-	suffix = strings.ToUpper(suffix) //忽略后缀匹配的大小写
-	for _, fi := range dir {
-		if !fi.IsDir() { // 忽略目录
-			continue
-		}
-		if strings.HasSuffix(strings.ToUpper(fi.Name()), suffix) { //匹配文件
-			var stFileItem FileItem
-			stFileItem.FileModifyTime = GetFileModTime(dirPth + PthSep + fi.Name())
-			stFileItem.FileName = fi.Name()
-			files = append(files, stFileItem)
-		}
-	}
-	sort.Sort(files)
-	return files, nil
-}
-
-func ListFile(dirPth string, suffix string) (files FileItems, err error) {
-	//files = make([]string, 0, 10)
-	dir, err := ioutil.ReadDir(dirPth)
-	if err != nil {
-		return nil, err
-	}
-	PthSep := string(os.PathSeparator)
-	suffix = strings.ToUpper(suffix) //忽略后缀匹配的大小写
-	for _, fi := range dir {
-		if fi.IsDir() { // 忽略目录
-			continue
-		}
-		if strings.HasSuffix(strings.ToUpper(fi.Name()), suffix) { //匹配文件
-			var stFileItem FileItem
-			stFileItem.FileModifyTime = GetFileModTime(dirPth + PthSep + fi.Name())
-			stFileItem.FileName = fi.Name()
-			stFileItem.FileDir = dirPth[4:]
-			stFileItem.FileCreateTime = GetFileCreateTime(dirPth + PthSep + fi.Name())
-			files = append(files, stFileItem)
-		}
-	}
-	sort.Sort(files)
-	return files, nil
-}
-
 func DealWithUdpPkg() {
 	//f, err1 := os.OpenFile("alian", os.O_APPEND, 0777)
-	var FileMap map[string]*os.File = make(map[string]*os.File);
 	udpAddr, err := net.ResolveUDPAddr("udp", G_StConf.UdpPort)
 	if err != nil {
 		log.Fatalln("Error: ", err)
-		os.Exit(0)
+		//os.Exit(0)
 	}
 
 	// Build listining connections
 	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		log.Fatalln("Error: ", err)
-		os.Exit(0)
+		//os.Exit(0)
 	}
 	defer conn.Close()
-	PthSep := string(os.PathSeparator)
 	// Interacting with one client at a time
 	recvBuff := make([]byte, 1500)
 	for {
@@ -402,83 +284,103 @@ func DealWithUdpPkg() {
 			time.Sleep(time.Millisecond * 30)
 			continue
 		}
-		//utils.Debugln("DealWithUdpPkg",string(recvBuff))
+
+		utils.Debugln("DealWithUdpPkg", string(recvBuff))
 		recvBuff2 := recvBuff[:rn]
-		var strReceived string = string(recvBuff2)
-		strReceived = strings.Replace(strReceived, "\n", "**&", -1)
-		strReceived = strings.Replace(strReceived, "\r", "**&", -1)
-		//fmt.Println(strReceived)
-		vLogItem := strings.Split(strReceived, "|")
-		vRoomLogItem := strings.Split(strReceived, "]")
-		if (len(vLogItem) < 3) {
-			continue
-		}
-		strFileDate := time.Now().Format("2006-01-02")
-		nHour, nMinute, nSecond := time.Now().Clock()
-		strNowTime := fmt.Sprintf("%s:%2.2d:%2.2d:%2.2d|", strFileDate, nHour, nMinute, nSecond)
-		_, err = os.Stat("log"+PthSep + strFileDate)
+		var logPkg LogContent
+		err = json.Unmarshal(recvBuff2, &logPkg)
 		if err != nil {
-			os.Mkdir("log"+PthSep+strFileDate, 0777)
-		}
-		strFileName := "log"+PthSep + strFileDate +PthSep + fmt.Sprintf(strFileDate+"_"+vLogItem[1]) + ".log"
-		if pfile, OK := FileMap[strFileName]; OK {
-			io.WriteString(pfile, strNowTime)
-			io.WriteString(pfile, strReceived)
-			io.WriteString(pfile, "\r\n")
-		} else {
-			pfile, _ = os.OpenFile(strFileName, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
-			_, OK := FileCreateTimeMap.Load(strFileName)
-			if !OK {
-				FileCreateTimeMap.Store(strFileName, time.Now().Format("2006/01/02 15:04:05"))
-			}
-			FileMap[strFileName] = pfile
-			io.WriteString(pfile, strNowTime)
-			io.WriteString(pfile, strReceived)
-			io.WriteString(pfile, "\r\n")
+			utils.Errorln("Error:", err.Error())
+			continue
 		}
 
-		//写room日志
-		if len(vRoomLogItem) < 3 {
-			continue
-		}
-		strRoom := vRoomLogItem[1][2:]
-		if (strRoom == "0") {
-			continue
-		}
-		_, err = os.Stat("room")
+		stmt, err := G_DBConn.Prepare("INSERT INTO loginfo(uid, level, time,tag, content) values(?,?,?,?,?)")
 		if err != nil {
-			os.Mkdir("room", 0777)
+			utils.Errorln("Error:", err.Error())
+			continue
 		}
-		strRoomFileName := "room/" + strRoom + ".log"
-		if pfile2, OK := FileMap[strRoomFileName]; OK {
-			io.WriteString(pfile2, strNowTime)
-			io.WriteString(pfile2, strReceived)
-			io.WriteString(pfile2, "\r\n")
-		} else {
-			pfile2, _ = os.OpenFile(strRoomFileName, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
-			FileMap[strRoomFileName] = pfile2
-			io.WriteString(pfile2, strNowTime)
-			io.WriteString(pfile2, strReceived)
-			io.WriteString(pfile2, "\r\n")
+		timeNow := time.Now().Unix()
+		err = stmt.Exec(logPkg.UID, logPkg.Level, timeNow, logPkg.Tag, logPkg.Content)
+		if err != nil {
+			utils.Errorln("Error:", err.Error())
+			continue
 		}
 
+	}
+}
+
+func checkErr(err error) {
+	if err != nil {
+		panic(err)
 	}
 }
 func main() {
 	//StartMysqlWriteTimer()
 	utils.SetLevel(4)
 	loadConf()
-	go DealWithUdpPkg()
-	time.Sleep(time.Second * 3)
-	conn, err := net.Dial("udp", "127.0.0.1:10433")
-	defer conn.Close()
+	var err error
+	G_DBConn, err = sqlite3.Open("test.sqlite")
 	if err != nil {
-		os.Exit(1)
+		checkErr(err)
 	}
-	conn.Write([]byte("1|阿涟|[00:31][10991] Hello\n \r world!"))
-	conn.Write([]byte("0"))
+	defer G_DBConn.Close()
+
+	// It's always a good idea to set a busy timeout
+	G_DBConn.BusyTimeout(5 * time.Second)
+	sql_table := `
+    CREATE TABLE IF NOT EXISTS loginfo(
+        uid INTEGER ,
+        level INTEGER,
+		time INTEGER,
+		tag VARCHAR(32),
+        content mediumblob NULL
+    );`
+	err = G_DBConn.Exec(sql_table)
+	if err != nil {
+		checkErr(err)
+	}
+	createIndex := `CREATE INDEX IndexUid ON loginfo (uid);`
+	G_DBConn.Exec(createIndex)
+	//stmt, err := db.Prepare("INSERT INTO loginfo(uid, level, time,tag, content) values(?,?,?,?,?)")
+	//checkErr(err)
+	//err = stmt.Exec(1023, 1, 20198888, "tag1", []byte("content"))
+	checkErr(err)
+	stmt, err := G_DBConn.Prepare(`SELECT * FROM loginfo WHERE uid = ?`, 1034)
+	hasRow, err := stmt.Step()
+	checkErr(err)
+	if !hasRow {
+		fmt.Println("don't have row")
+	}
+	var uid int64
+	var level int
+	var rcvTime int64
+	var tag string
+	var content string
+	err = stmt.Scan(&uid, &level, &rcvTime, &tag, &content)
+	if err != nil {
+		checkErr(err)
+	}
+
+	go DealWithUdpPkg()
+	time.Sleep(time.Second)
+	udpconn, err := net.Dial("udp", "127.0.0.1:9016")
+	defer udpconn.Close()
+	if err != nil {
+		fmt.Println("net.Dial error", err.Error())
+	}
+	var stLogContent LogContent
+	stLogContent.UID = 1034
+	stLogContent.Level = "debug"
+	stLogContent.Tag = "fadf"
+	stLogContent.Content = "testcontent"
+	logBuff, _ := json.Marshal(stLogContent)
+	//"uid|level|"
+	udpconn.Write(logBuff)
+	udpconn.Write([]byte("0"))
 	var rdbuff []byte
-	conn.Read(rdbuff)
+	udpconn.Read(rdbuff)
 	fmt.Println(string(rdbuff))
+	go getFilelist("./LogFiles/")
 	StartWeb()
+
 }

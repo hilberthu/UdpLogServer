@@ -4,11 +4,10 @@ import (
 	//"time"
 	//"strconv"
 	//"os"
-	"encoding/hex"
-	"strings"
 	"bytes"
 	"encoding/binary"
-	"github.com/mahonia"
+	"encoding/hex"
+	"strings"
 )
 
 func GetFromHex(hexSource string) (to []byte, err error) {
@@ -24,8 +23,7 @@ func GetFromHex(hexSource string) (to []byte, err error) {
 func GetFromUtf8(bs []byte) string {
 	//enc2 := mahonia.NewEncoder("UTF-8")
 	//enc2.ConvertString()
-	decoder := mahonia.NewDecoder("UTF-8")
-	return decoder.ConvertString(string([]byte(bs)))
+	return string(bs)
 }
 
 func GetFromUnicode(source string) (to string, err error) {

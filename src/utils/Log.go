@@ -28,7 +28,6 @@
 package utils
 
 import (
-	"github.com/cprint"
 	"errors"
 	"fmt"
 	"io"
@@ -133,19 +132,7 @@ func getLevelName(nLevel int) string {
 	}
 }
 func logLevelToCPrintLevel(nLevel int) int {
-
-	switch nLevel {
-	case DEBUG:
-		return cprint.DEBUG
-	case WARN:
-		return cprint.WARING
-	case ERROR:
-		return cprint.ERROR
-	case INFO:
-		return cprint.NOTICE
-	default:
-		return cprint.DEBUG
-	}
+	return nLevel
 }
 
 func SetServerType(nType int32) {
@@ -521,8 +508,6 @@ func (l *Logger) Output(nLevel int, uUid uint32, calldepth int, s string) error 
 
 	if nLevel <= nLogLevel {
 		// 打印到屏幕
-		cprint.P(logLevelToCPrintLevel(nLevel), strOutPut)
-
 		// 发远程日志服务器
 		//PushLog(nServerType, nLevel, uUid, &strOutPut, time.Now().Unix())
 	}
